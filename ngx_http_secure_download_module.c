@@ -12,6 +12,7 @@
 
 #define FOLDER_MODE 0
 #define FILE_MODE 1
+#define COMPLEX_MODE 2
 
 typedef struct {
   const char *timestamp;
@@ -19,6 +20,8 @@ typedef struct {
   const char *path;
   int path_len;
   int path_to_hash_len;
+  ngx_str_t parsed_expiry;
+  ngx_str_t parsed_hash;
 } ngx_http_secure_download_split_uri_t;
 
 static ngx_int_t ngx_http_secure_download_split_uri (ngx_http_request_t*, ngx_http_secure_download_split_uri_t*);
@@ -37,6 +40,8 @@ typedef struct {
   ngx_flag_t enable;
   ngx_flag_t path_mode;
   ngx_str_t secret;
+  ngx_http_complex_value_t hash_cv;
+  ngx_http_complex_value_t expires_cv;
   ngx_array_t  *secret_lengths;
   ngx_array_t  *secret_values;
 } ngx_http_secure_download_loc_conf_t;
@@ -52,7 +57,7 @@ static ngx_command_t ngx_http_secure_download_commands[] = {
   },
   {
     ngx_string("secure_download_path_mode"),
-    NGX_HTTP_LOC_CONF|NGX_CONF_TAKE1,
+    NGX_HTTP_LOC_CONF|NGX_CONF_TAKE13,
     ngx_conf_set_path_mode,
     NGX_HTTP_LOC_CONF_OFFSET,
     offsetof(ngx_http_secure_download_loc_conf_t, path_mode),
@@ -101,20 +106,75 @@ static ngx_str_t  ngx_http_secure_download = ngx_string("secure_download");
 
 static char * ngx_conf_set_path_mode(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 {
+  ngx_http_compile_complex_value_t   ccv;
   ngx_str_t *d = cf->args->elts;
   ngx_http_secure_download_loc_conf_t *sdlc = conf;
 
   if ((d[1].len == 6) && (strncmp((char*)d[1].data, "folder", 6) == 0))
   {
+    if (cf->args->nelts != 2) {
+      ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                         "incorrect number of arguments for folder.  Expected none, got %d",
+                         cf->args->nelts - 2);
+      return NGX_CONF_ERROR;
+    }
     sdlc->path_mode = FOLDER_MODE;
   }
   else if((d[1].len == 4) && (strncmp((char*)d[1].data, "file", 4) == 0))
   {
+    if (cf->args->nelts != 2) {
+      ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                         "incorrect number of arguments for file.  Expected none, got %d",
+                         cf->args->nelts - 2);
+      return NGX_CONF_ERROR;
+    }
     sdlc->path_mode = FILE_MODE;
+  }
+  else if((d[1].len == 7) && (strncmp((char*)d[1].data, "complex", 7) == 0))
+  {
+    if (cf->args->nelts != 4) {
+      ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                         "incorrect number of arguments for complex.  Expected 2, got %d",
+                         cf->args->nelts - 2);
+      return NGX_CONF_ERROR;
+    }
+
+    sdlc->path_mode = COMPLEX_MODE;
+
+    // Extract hash_cv
+    ngx_memzero(&ccv, sizeof(ngx_http_compile_complex_value_t));
+    ccv.cf = cf;
+    ccv.value = &(d[2]);
+    ccv.complex_value = &sdlc->hash_cv;
+    if (ngx_http_compile_complex_value(&ccv) != NGX_OK) {
+        return NGX_CONF_ERROR;
+    }
+    if (ccv.complex_value->lengths == NULL) {
+      ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                         "invalid hash; complex value is required: \"%V\"",
+                         &d[2]);
+      return NGX_CONF_ERROR;
+    }
+
+    // Extract expires_cv
+    ngx_memzero(&ccv, sizeof(ngx_http_compile_complex_value_t));
+    ccv.cf = cf;
+    ccv.value = &(d[3]);
+    ccv.complex_value = &sdlc->expires_cv;
+    if (ngx_http_compile_complex_value(&ccv) != NGX_OK) {
+        return NGX_CONF_ERROR;
+    }
+    if (ccv.complex_value->lengths == NULL) {
+      ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                         "invalid expires; complex value is required: \"%V\"",
+                         &d[3]);
+      return NGX_CONF_ERROR;
+    }
+
   }
   else
   {
-    ngx_conf_log_error(NGX_LOG_EMERG, cf, 0, "secure_download_path_mode should be folder or file", 0);
+    ngx_conf_log_error(NGX_LOG_EMERG, cf, 0, "secure_download_path_mode should be folder, file, or complex", 0);
     return NGX_CONF_ERROR;
   }
   return NGX_CONF_OK;
@@ -139,6 +199,11 @@ static char * ngx_http_secure_download_merge_loc_conf (ngx_conf_t *cf, void *par
 {
   ngx_http_secure_download_loc_conf_t *prev = parent;
   ngx_http_secure_download_loc_conf_t *conf = child;
+
+  if (conf->path_mode == NGX_CONF_UNSET && prev->path_mode == COMPLEX_MODE) {
+    conf->hash_cv = prev->hash_cv;
+    conf->expires_cv = prev->expires_cv;
+  }
 
   ngx_conf_merge_value(conf->enable, prev->enable, 0);
   ngx_conf_merge_value(conf->path_mode, prev->path_mode, FOLDER_MODE);
@@ -352,21 +417,52 @@ static ngx_int_t ngx_http_secure_download_split_uri(ngx_http_request_t *r, ngx_h
 
   ngx_http_secure_download_loc_conf_t *sdc = ngx_http_get_module_loc_conf(r, ngx_http_secure_download_module);
 
-  while(len && uri[--len] != '/')
-	  ++tstamp_len;
+  // Parse expiration time
+  if (sdc->path_mode != COMPLEX_MODE) {
+    while(len && uri[--len] != '/')
+      ++tstamp_len;
+  } else {
+    if (ngx_http_complex_value(r, &sdc->expires_cv, &sdsu->parsed_expiry)
+        != NGX_OK) {
+      ngx_log_debug(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                    "Unable to evaluate expiry value");
+      return NGX_ERROR;
+    }
+    tstamp_len = sdsu->parsed_expiry.len;
+  }
   if(tstamp_len != 8) {
 	  ngx_log_debug(NGX_LOG_DEBUG_HTTP, r->connection->log, 0, "timestamp size mismatch: %d", tstamp_len);
 	  return NGX_ERROR;
   }
-  sdsu->timestamp = uri + len + 1;
 
-  while(len && uri[--len] != '/')
-	  ++md5_len;
+
+  if (sdc->path_mode != COMPLEX_MODE) {
+    sdsu->timestamp = uri + len + 1;
+  } else {
+    sdsu->timestamp = (const char *)sdsu->parsed_expiry.data;
+  }
+
+  if (sdc->path_mode != COMPLEX_MODE) {
+    while(len && uri[--len] != '/')
+      ++md5_len;
+  } else {
+    if (ngx_http_complex_value(r, &sdc->hash_cv, &sdsu->parsed_hash) != NGX_OK) {
+      ngx_log_debug(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                    "Unable to evaluate hash value");
+      return NGX_ERROR;
+    }
+    md5_len = sdsu->parsed_hash.len;
+  }
+
   if(md5_len != 32) {
 	  ngx_log_debug(NGX_LOG_DEBUG_HTTP, r->connection->log, 0, "md5 size mismatch: %d", md5_len);
 	  return NGX_ERROR;
   }
-  sdsu->md5 = uri + len + 1;
+  if (sdc->path_mode != COMPLEX_MODE) {
+    sdsu->md5 = uri + len + 1;
+  } else {
+    sdsu->md5 = (const char *)sdsu->parsed_hash.data;
+  }
 
   if(len == 0) {
 	  ngx_log_debug(NGX_LOG_DEBUG_HTTP, r->connection->log, 0, "bad path", 0);
