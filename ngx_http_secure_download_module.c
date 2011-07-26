@@ -30,20 +30,15 @@ static void * ngx_http_secure_download_create_loc_conf(ngx_conf_t*);
 static char * ngx_http_secure_download_merge_loc_conf (ngx_conf_t*, void*, void*);
 static ngx_int_t ngx_http_secure_download_add_variables(ngx_conf_t *cf);
 static ngx_int_t ngx_http_secure_download_variable(ngx_http_request_t *r, ngx_http_variable_value_t *v, uintptr_t data);
-static char * ngx_conf_set_path_mode(ngx_conf_t*, ngx_command_t*, void*);
-
-static char *ngx_http_secure_download_secret(ngx_conf_t *cf, void *post, void *data);
-static ngx_conf_post_handler_pt  ngx_http_secure_download_secret_p =
-    ngx_http_secure_download_secret;
+static char * ngx_conf_secure_download_set_path_mode(ngx_conf_t*, ngx_command_t*, void*);
+static char * ngx_conf_secure_download_set_secrets(ngx_conf_t*, ngx_command_t*, void*);
 
 typedef struct {
   ngx_flag_t enable;
   ngx_flag_t path_mode;
-  ngx_str_t secret;
+  ngx_array_t *secret_cvs;
   ngx_http_complex_value_t hash_cv;
   ngx_http_complex_value_t expires_cv;
-  ngx_array_t  *secret_lengths;
-  ngx_array_t  *secret_values;
 } ngx_http_secure_download_loc_conf_t;
 
 static ngx_command_t ngx_http_secure_download_commands[] = {
@@ -55,21 +50,23 @@ static ngx_command_t ngx_http_secure_download_commands[] = {
     offsetof(ngx_http_secure_download_loc_conf_t, enable),
     NULL
   },
+
   {
     ngx_string("secure_download_path_mode"),
     NGX_HTTP_LOC_CONF|NGX_CONF_TAKE13,
-    ngx_conf_set_path_mode,
+    ngx_conf_secure_download_set_path_mode,
     NGX_HTTP_LOC_CONF_OFFSET,
-    offsetof(ngx_http_secure_download_loc_conf_t, path_mode),
+    0,
     NULL
   },
+
   {
     ngx_string("secure_download_secret"),
-    NGX_HTTP_LOC_CONF|NGX_CONF_TAKE1,
-    ngx_conf_set_str_slot,
+    NGX_HTTP_LOC_CONF|NGX_CONF_1MORE,
+    ngx_conf_secure_download_set_secrets,
     NGX_HTTP_LOC_CONF_OFFSET,
-    offsetof(ngx_http_secure_download_loc_conf_t, secret),
-    &ngx_http_secure_download_secret_p
+    0,
+    NULL
   }
 };
 
@@ -104,7 +101,7 @@ ngx_module_t ngx_http_secure_download_module = {
 
 static ngx_str_t  ngx_http_secure_download = ngx_string("secure_download");
 
-static char * ngx_conf_set_path_mode(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
+static char * ngx_conf_secure_download_set_path_mode(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 {
   ngx_http_compile_complex_value_t   ccv;
   ngx_str_t *d = cf->args->elts;
@@ -180,6 +177,44 @@ static char * ngx_conf_set_path_mode(ngx_conf_t *cf, ngx_command_t *cmd, void *c
   return NGX_CONF_OK;
 }
 
+static char * ngx_conf_secure_download_set_secrets(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
+{
+  ngx_http_compile_complex_value_t     ccv;
+  ngx_http_complex_value_t            *cv;
+  ngx_http_secure_download_loc_conf_t *sdlc = conf;
+  ngx_uint_t                           i;
+
+  // Allocate space for the complex value
+  if (sdlc->secret_cvs == NULL) {
+      sdlc->secret_cvs = ngx_array_create(cf->pool, cf->args->nelts - 1,
+                                          sizeof(ngx_http_complex_value_t));
+      if (sdlc->secret_cvs == NULL) {
+          return NGX_CONF_ERROR;
+      }
+  }
+
+  for (i = 1; i < cf->args->nelts; i++) {
+    ngx_str_t *args = cf->args->elts;
+    ngx_str_t *arg = &args[i];
+
+    // Get a ptr to cv from the array/pool
+    cv = (ngx_http_complex_value_t *)ngx_array_push(sdlc->secret_cvs);
+
+    // Reinit the local compile complex compile value
+    ngx_memzero(&ccv, sizeof(ngx_http_compile_complex_value_t));
+    ccv.cf = cf;
+    ccv.value = arg;
+    ccv.complex_value = cv;
+
+    // Compile the value for later
+    if (ngx_http_compile_complex_value(&ccv) != NGX_OK) {
+        return NGX_CONF_ERROR;
+    }
+  }
+
+  return NGX_CONF_OK;
+}
+
 static void * ngx_http_secure_download_create_loc_conf(ngx_conf_t *cf)
 {
   ngx_http_secure_download_loc_conf_t *conf;
@@ -190,8 +225,8 @@ static void * ngx_http_secure_download_create_loc_conf(ngx_conf_t *cf)
   }
   conf->enable = NGX_CONF_UNSET;
   conf->path_mode = NGX_CONF_UNSET;
-  conf->secret.data = NULL;
-  conf->secret.len = 0;
+  conf->secret_cvs = NULL;
+
   return conf;
 }
 
@@ -207,12 +242,15 @@ static char * ngx_http_secure_download_merge_loc_conf (ngx_conf_t *cf, void *par
 
   ngx_conf_merge_value(conf->enable, prev->enable, 0);
   ngx_conf_merge_value(conf->path_mode, prev->path_mode, FOLDER_MODE);
-  ngx_conf_merge_str_value(conf->secret, prev->secret, "");
+
+  if (conf->secret_cvs == NULL) {
+      conf->secret_cvs = prev->secret_cvs;
+  }
 
   if (conf->enable == 1) {
-      if (conf->secret.len == 0) {
+      if (!conf->secret_cvs || conf->secret_cvs->nelts == 0) {
           ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
-               "no secure_download_secret specified");
+               "no 'secure_download_secret's specified");
           return NGX_CONF_ERROR;
       }
   }
@@ -225,33 +263,45 @@ static ngx_int_t ngx_http_secure_download_variable(ngx_http_request_t *r, ngx_ht
   unsigned remaining_time = 0;
   ngx_http_secure_download_loc_conf_t *sdc;
   ngx_http_secure_download_split_uri_t sdsu;
-  ngx_str_t rel_path;
+  ngx_http_complex_value_t *cvs;
   ngx_str_t secret;
+  ngx_uint_t i;
+  ngx_flag_t hash_matched;
   int value = 0;
+
+  // Instead of the hash being calculated on every request and routing
+  // appropriately, this module invokes the hash calculation lazily when
+  // accessing the variable.
 
   sdc = ngx_http_get_module_loc_conf(r, ngx_http_secure_download_module);
   if (sdc->enable != 1)
   {
+      // Secure Download variable was accessed but was not explicitly enabled
+      // for this location... oops
       ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
           "securedownload: module not enabled");
       value = -3;
       goto finish;
   }
 
-  if (!sdc->secret_lengths || !sdc->secret_values) {
+  if (!sdc->secret_cvs || !sdc->secret_cvs->nelts) {
+      // You didn't set up any secret lengths/values... oops
       ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
-          "securedownload: module enabled, but secret key not configured!");
+          "securedownload: module enabled, but secret key(s) not configured!");
       value = -3;
       goto finish;
   }
 
   if (ngx_http_secure_download_split_uri(r, &sdsu) == NGX_ERROR)
   {
+    // This splits the hash/timestamp out of the URI *or* evaluates them
+    // out using the provided variables.
     ngx_log_debug(NGX_LOG_DEBUG_HTTP, r->connection->log, 0, "received an error from ngx_http_secure_download_split_uri", 0);
     value = -3;
     goto finish;
   }
 
+  // Attempt to convert the parsed out string timestamp to an integer
   if (sscanf(sdsu.timestamp, "%08X", &timestamp) != 1)
   {
     ngx_log_debug(NGX_LOG_DEBUG_HTTP, r->connection->log, 0, "error in timestamp hex-dec conversion", 0);
@@ -259,6 +309,8 @@ static ngx_int_t ngx_http_secure_download_variable(ngx_http_request_t *r, ngx_ht
     goto finish;
   }
 
+  // Determine if the URL has expired by comparing the signed expiry time
+  // to the current value of time(NULL)
   remaining_time = timestamp - (unsigned) time(NULL);
   if ((int)remaining_time <= 0)
   {
@@ -267,25 +319,31 @@ static ngx_int_t ngx_http_secure_download_variable(ngx_http_request_t *r, ngx_ht
     goto finish;
   }
 
-  if (ngx_http_script_run(r, &secret, sdc->secret_lengths->elts, 0, sdc->secret_values->elts) == NULL) {
+  // Let's evaluate some secrets!
+  hash_matched = FALSE;
+  cvs = sdc->secret_cvs->elts;
+  for (i = 0; i < sdc->secret_cvs->nelts; i++) {
+    if (ngx_http_complex_value(r, &cvs[i], &secret) != NGX_OK) {
       ngx_log_error(NGX_LOG_INFO, r->connection->log, 0,
           "securedownload: evaluation failed");
       value = -3;
       goto finish;
+    }
+
+    ngx_log_error(NGX_LOG_INFO, r->connection->log, 0,
+      "securedownload: evaluated value of secret: \"%V\"", &secret);
+    if (ngx_http_secure_download_check_hash(r, &sdsu, &secret) == NGX_OK) {
+      hash_matched = TRUE;
+      value = 0;
+      break;
+    }
   }
 
-  ngx_log_error(NGX_LOG_INFO, r->connection->log, 0,
-    "securedownload: evaluated value of secret: \"%V\"", &secret);
-
-  if (ngx_http_secure_download_check_hash(r, &sdsu, &secret) != NGX_OK)
-  {
+  if (!hash_matched) {
     ngx_log_debug(NGX_LOG_DEBUG_HTTP, r->connection->log, 0, "bad hash", 0);
     value = -2;
     goto finish;
   }
-
-  rel_path.data = r->uri.data;
-  rel_path.len = sdsu.path_len;
 
   finish:
 
@@ -313,37 +371,6 @@ static ngx_int_t ngx_http_secure_download_variable(ngx_http_request_t *r, ngx_ht
   return NGX_OK;
 }
 
-//////////////////////
-static char *
-ngx_http_secure_download_compile_secret(ngx_conf_t *cf, ngx_http_secure_download_loc_conf_t *sdc)
-{
-
-    ngx_http_script_compile_t   sc;
-    ngx_memzero(&sc, sizeof(ngx_http_script_compile_t));
-
-    sc.cf = cf;
-    sc.source = &sdc->secret;
-    sc.lengths = &sdc->secret_lengths;
-    sc.values = &sdc->secret_values;
-    sc.variables = ngx_http_script_variables_count(&sdc->secret);
-    sc.complete_lengths = 1;
-    sc.complete_values = 1;
-
-    if (ngx_http_script_compile(&sc) != NGX_OK) {
-        return NGX_CONF_ERROR;
-    }
-
-    return NGX_CONF_OK;
-}
-
-static char *
-ngx_http_secure_download_secret(ngx_conf_t *cf, void *post, void *data)
-{
-    ngx_http_secure_download_loc_conf_t *sdc =
-	    ngx_http_conf_get_module_loc_conf(cf, ngx_http_secure_download_module);
-
-    return ngx_http_secure_download_compile_secret(cf, sdc);
-}
 ////////////////////////
 
 static ngx_int_t ngx_http_secure_download_check_hash(ngx_http_request_t *r, ngx_http_secure_download_split_uri_t *sdsu, ngx_str_t *secret)
