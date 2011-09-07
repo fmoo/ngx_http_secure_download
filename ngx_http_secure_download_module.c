@@ -36,9 +36,11 @@ static char * ngx_conf_secure_download_set_secrets(ngx_conf_t*, ngx_command_t*, 
 typedef struct {
   ngx_flag_t enable;
   ngx_flag_t path_mode;
+  ngx_flag_t path_override;
   ngx_array_t *secret_cvs;
   ngx_http_complex_value_t hash_cv;
   ngx_http_complex_value_t expires_cv;
+  ngx_http_complex_value_t path_cv;
 } ngx_http_secure_download_loc_conf_t;
 
 static ngx_command_t ngx_http_secure_download_commands[] = {
@@ -53,7 +55,7 @@ static ngx_command_t ngx_http_secure_download_commands[] = {
 
   {
     ngx_string("secure_download_path_mode"),
-    NGX_HTTP_LOC_CONF|NGX_CONF_TAKE13,
+    NGX_HTTP_LOC_CONF|NGX_CONF_TAKE13|NGX_CONF_TAKE4,
     ngx_conf_secure_download_set_path_mode,
     NGX_HTTP_LOC_CONF_OFFSET,
     0,
@@ -129,10 +131,10 @@ static char * ngx_conf_secure_download_set_path_mode(ngx_conf_t *cf, ngx_command
   }
   else if((d[1].len == 7) && (strncmp((char*)d[1].data, "complex", 7) == 0))
   {
-    if (cf->args->nelts != 4) {
+    if (cf->args->nelts != 4 && cf->args->nelts != 5) {
       ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
-                         "incorrect number of arguments for complex.  Expected 2, got %d",
-                         cf->args->nelts - 2);
+                         "incorrect number of arguments for complex.  "
+                         "Expected 2-3, got %d", cf->args->nelts - 2);
       return NGX_CONF_ERROR;
     }
 
@@ -168,6 +170,25 @@ static char * ngx_conf_secure_download_set_path_mode(ngx_conf_t *cf, ngx_command
       return NGX_CONF_ERROR;
     }
 
+    // Extract path_cv
+    if (cf->args->nelts == 5) {
+      ngx_memzero(&ccv, sizeof(ngx_http_compile_complex_value_t));
+      ccv.cf = cf;
+      ccv.value = &(d[4]);
+      ccv.complex_value = &sdlc->path_cv;
+      if (ngx_http_compile_complex_value(&ccv) != NGX_OK) {
+          return NGX_CONF_ERROR;
+      }
+      if (ccv.complex_value->lengths == NULL) {
+        ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
+                           "invalid path; complex value is required: \"%V\"",
+                           &d[4]);
+        return NGX_CONF_ERROR;
+      }
+      sdlc->path_override = 1;
+    } else {
+      sdlc->path_override = 0;
+    }
   }
   else
   {
@@ -225,6 +246,7 @@ static void * ngx_http_secure_download_create_loc_conf(ngx_conf_t *cf)
   }
   conf->enable = NGX_CONF_UNSET;
   conf->path_mode = NGX_CONF_UNSET;
+  conf->path_override = NGX_CONF_UNSET;
   conf->secret_cvs = NULL;
 
   return conf;
@@ -238,8 +260,10 @@ static char * ngx_http_secure_download_merge_loc_conf (ngx_conf_t *cf, void *par
   if (conf->path_mode == NGX_CONF_UNSET && prev->path_mode == COMPLEX_MODE) {
     conf->hash_cv = prev->hash_cv;
     conf->expires_cv = prev->expires_cv;
+    conf->path_cv = prev->path_cv;
   }
 
+  ngx_conf_merge_value(conf->path_override, prev->path_override, 0);
   ngx_conf_merge_value(conf->enable, prev->enable, 0);
   ngx_conf_merge_value(conf->path_mode, prev->path_mode, FOLDER_MODE);
 
@@ -439,10 +463,27 @@ static ngx_int_t ngx_http_secure_download_split_uri(ngx_http_request_t *r, ngx_h
 {
   int md5_len = 0;
   int tstamp_len = 0;
-  int len = r->uri.len;
-  const char *uri = (char*)r->uri.data;
+  int len;
+  const char *uri;
+  ngx_str_t parsed_path;
 
   ngx_http_secure_download_loc_conf_t *sdc = ngx_http_get_module_loc_conf(r, ngx_http_secure_download_module);
+
+  // Let's get the URI / length first
+  if (sdc->path_mode != COMPLEX_MODE ||
+      sdc->path_override == 0) {
+    uri = (char*)r->uri.data;
+    len = r->uri.len;
+  } else {
+    if (ngx_http_complex_value(r, &sdc->path_cv, &parsed_path)
+        != NGX_OK) {
+      ngx_log_debug(NGX_LOG_DEBUG_HTTP, r->connection->log, 0,
+                    "Unable to evaluate path value");
+      return NGX_ERROR;
+    }
+    uri = (char*)parsed_path.data;
+    len = parsed_path.len;
+  }
 
   // Parse expiration time
   if (sdc->path_mode != COMPLEX_MODE) {
