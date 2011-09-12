@@ -103,6 +103,7 @@ static char * ngx_conf_set_path_mode(ngx_conf_t *cf, ngx_command_t *cmd, void *c
 {
   ngx_str_t *d = cf->args->elts;
   ngx_http_secure_download_loc_conf_t *sdlc = conf;
+
   if ((d[1].len == 6) && (strncmp((char*)d[1].data, "folder", 6) == 0))
   {
     sdlc->path_mode = FOLDER_MODE;
@@ -142,7 +143,7 @@ static char * ngx_http_secure_download_merge_loc_conf (ngx_conf_t *cf, void *par
   ngx_conf_merge_value(conf->enable, prev->enable, 0);
   ngx_conf_merge_value(conf->path_mode, prev->path_mode, FOLDER_MODE);
   ngx_conf_merge_str_value(conf->secret, prev->secret, "");
-  
+
   if (conf->enable == 1) {
       if (conf->secret.len == 0) {
           ngx_conf_log_error(NGX_LOG_EMERG, cf, 0,
@@ -150,7 +151,7 @@ static char * ngx_http_secure_download_merge_loc_conf (ngx_conf_t *cf, void *par
           return NGX_CONF_ERROR;
       }
   }
-  
+
   return NGX_CONF_OK;
 }
 
@@ -162,7 +163,7 @@ static ngx_int_t ngx_http_secure_download_variable(ngx_http_request_t *r, ngx_ht
   ngx_str_t rel_path;
   ngx_str_t secret;
   int value = 0;
-  
+
   sdc = ngx_http_get_module_loc_conf(r, ngx_http_secure_download_module);
   if (sdc->enable != 1)
   {
@@ -171,7 +172,7 @@ static ngx_int_t ngx_http_secure_download_variable(ngx_http_request_t *r, ngx_ht
       value = -3;
       goto finish;
   }
-  
+
   if (!sdc->secret_lengths || !sdc->secret_values) {
       ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
           "securedownload: module enabled, but secret key not configured!");
@@ -192,7 +193,7 @@ static ngx_int_t ngx_http_secure_download_variable(ngx_http_request_t *r, ngx_ht
     value = -3;
     goto finish;
   }
-  
+
   remaining_time = timestamp - (unsigned) time(NULL);
   if ((int)remaining_time <= 0)
   {
@@ -200,29 +201,29 @@ static ngx_int_t ngx_http_secure_download_variable(ngx_http_request_t *r, ngx_ht
     value = -1;
     goto finish;
   }
-  
+
   if (ngx_http_script_run(r, &secret, sdc->secret_lengths->elts, 0, sdc->secret_values->elts) == NULL) {
       ngx_log_error(NGX_LOG_INFO, r->connection->log, 0,
           "securedownload: evaluation failed");
       value = -3;
       goto finish;
   }
-  
+
   ngx_log_error(NGX_LOG_INFO, r->connection->log, 0,
     "securedownload: evaluated value of secret: \"%V\"", &secret);
-    
+
   if (ngx_http_secure_download_check_hash(r, &sdsu, &secret) != NGX_OK)
   {
     ngx_log_debug(NGX_LOG_DEBUG_HTTP, r->connection->log, 0, "bad hash", 0);
     value = -2;
     goto finish;
   }
-  
+
   rel_path.data = r->uri.data;
   rel_path.len = sdsu.path_len;
-  
-  finish: 
-  
+
+  finish:
+
   v->not_found = 0;
   v->valid = 1;
   v->no_cacheable = 0;
@@ -243,7 +244,7 @@ static ngx_int_t ngx_http_secure_download_variable(ngx_http_request_t *r, ngx_ht
     v->len = (int) sprintf((char*)v->data, "%i", value);
     //printf("problem %i\n", value);
   }
-  
+
   return NGX_OK;
 }
 
@@ -329,13 +330,13 @@ static ngx_int_t ngx_http_secure_download_check_hash(ngx_http_request_t *r, ngx_
 	  hash[2 * i + 0] = xtoc[generated_hash[i] >> 4];
 	  hash[2 * i + 1] = xtoc[generated_hash[i] & 0xf];
   }
-  
+
   hash[32] = 0; //because %.32 doesn't work
-  ngx_log_debug(NGX_LOG_DEBUG_HTTP, r->connection->log, 0, "computed hash: %32s", hash); 
+  ngx_log_debug(NGX_LOG_DEBUG_HTTP, r->connection->log, 0, "computed hash: %32s", hash);
   // ngx_log_debug(NGX_LOG_DEBUG_HTTP, r->connection->log, 0, "hash from uri: %.32s", sdsu->md5);
 
   if(memcmp(hash, sdsu->md5, 32) != 0) {
-	  ngx_log_debug(NGX_LOG_DEBUG_HTTP, r->connection->log, 0, "hash mismatch", 0); 	  
+	  ngx_log_debug(NGX_LOG_DEBUG_HTTP, r->connection->log, 0, "hash mismatch", 0);
 	  return NGX_ERROR;
   }
 
